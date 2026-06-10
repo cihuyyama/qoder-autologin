@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Debug artifacts
+qoder_debug.png
+*.log
+
+# Accounts file (contains credentials)
+accounts.txt
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
