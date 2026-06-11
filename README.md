@@ -1,7 +1,7 @@
-# Qoder Auto-Login for 9router
+# Qoder Auto-Login — JSON Output
 
-Tool otomatis untuk login dan menambahkan akun Qoder ke 9router via Google SSO.
-Reverse-engineered dari 9router v0.4.71.
+Tool otomatis untuk login akun Qoder via Google SSO dan menyimpan token ke file JSON (format `providerConnections`).
+Reverse-engineered dari 9router v0.4.71. **Tidak perlu 9router** — output berupa file JSON portable.
 
 ## ✨ Features
 
@@ -9,15 +9,17 @@ Reverse-engineered dari 9router v0.4.71.
 - **Batch mode** — login banyak akun sekaligus dari file
 - **Concurrent processing** — beberapa browser jalan bareng (1-5)
 - **Headless mode** — browser invisible untuk automation
-- **Skip existing** — auto-skip akun yang sudah ada di 9router DB
+- **JSON output** — save token ke file JSON (format 9router `providerConnections`)
+- **Custom output path** — tentukan lokasi file output via `--output`
+- **Skip existing** — auto-skip akun yang sudah ada di file JSON output
 - **Consent handler** — otomatis handle semua Google agreement screens:
   - "Saya mengerti" / "I understand"
   - "Continue" / "Lanjutkan"
   - "This app isn't verified" → Advanced → Go to...
   - OAuth scope consent
   - Workspace admin consent
-- **Interactive mode** — preview akun + toggle headless + confirm sebelum jalan
-- **9router version check** — block kalau versi 9router terlalu lama
+- **Interactive mode** — preview akun + toggle headless + pilih output file + confirm sebelum jalan
+- **Portable** — tidak perlu 9router, tidak perlu Node.js, cukup Python 3.8+
 - **PKCE + nonce** — secure device auth flow (sama persis kayak 9router)
 
 ## 📋 Requirements
@@ -25,9 +27,9 @@ Reverse-engineered dari 9router v0.4.71.
 | Requirement | Minimum |
 |-------------|---------|
 | **Windows** | 10 / 11 |
-| **Python** | 3.10+ |
-| **9router** | v0.4.71+ (auto-checked) |
-| **Node.js** | Required by 9router |
+| **Python** | 3.8+ |
+
+> **Tidak perlu 9router atau Node.js!** Tool ini standalone — output langsung ke file JSON.
 
 ## 🚀 Quick Start
 
@@ -51,19 +53,29 @@ playwright install chromium
 
 **Single account:**
 ```bash
-qoder-login.bat email@gmail.com:password123
+python qoder_autologin.py email@gmail.com:password123
 ```
 
 **Batch dari file:**
 ```bash
-qoder-login.bat --batch accounts.txt
+python qoder_autologin.py --batch accounts.txt
+```
+
+**Batch dengan custom output:**
+```bash
+python qoder_autologin.py --batch accounts.txt --output qoder-accounts.json
+```
+
+**Test mode (tanpa save):**
+```bash
+python qoder_autologin.py --batch accounts.txt --test --headless
 ```
 
 **Interactive (double-click `run-batch.bat`):**
 
 ```
   ===================================================
-     Qoder Auto-Login for 9router - Batch Mode
+     Qoder Auto-Login — JSON Output - Batch Mode
   ===================================================
 
   [i] Found 14 account(s) in accounts.txt
@@ -76,12 +88,13 @@ qoder-login.bat --batch accounts.txt
 
   Headless mode? (browser invisible) [y/N]: n
   Concurrent browsers (1-5) [1]: 2
+  Output JSON file [qoder-accounts.json]:
 
   +--------------------------------------+
   |  Accounts:   14
   |  Browser:    Visible
   |  Concurrent: 2
-  |  Save to:    9router DB
+  |  Output:     qoder-accounts.json
   +--------------------------------------+
 
   Start login? [Y/n]:
@@ -97,6 +110,7 @@ qoder-autologin/
 ├── run-batch.bat           ← Interactive batch launcher
 ├── accounts.txt            ← Akun kamu (jangan di-commit!)
 ├── accounts.txt.example    ← Template (safe to commit)
+├── qoder-accounts.json     ← Output file (auto-generated)
 ├── requirements.txt        ← Python dependencies
 ├── .gitignore
 └── README.md
@@ -113,12 +127,50 @@ email2@gmail.com:password2
 email3@workspace.com:password3
 ```
 
+## 📄 Format Output JSON
+
+File output (`qoder-accounts.json`) berisi array JSON dengan format `providerConnections`:
+
+```json
+[
+  {
+    "displayName": "John Doe",
+    "accessToken": "eyJ...",
+    "refreshToken": "AMf-...",
+    "expiresAt": "2026-06-12T12:00:00+00:00",
+    "testStatus": "active",
+    "expiresIn": 2591998,
+    "providerSpecificData": {
+      "authMethod": "device",
+      "userId": "user-uuid",
+      "machineId": "machine-uuid",
+      "organizationId": ""
+    },
+    "lastError": null,
+    "errorCode": null,
+    "lastErrorAt": null,
+    "backoffLevel": 0,
+    "id": "connection-uuid",
+    "provider": "qoder",
+    "authType": "oauth",
+    "name": "email@gmail.com",
+    "email": "email@gmail.com",
+    "priority": 1,
+    "isActive": true,
+    "createdAt": "2026-06-11T12:00:00+00:00",
+    "updatedAt": "2026-06-11T12:00:00+00:00"
+  }
+]
+```
+
+> Format ini kompatibel dengan 9router `providerConnections` — bisa di-import manual jika diperlukan.
+
 ## 🔧 CLI Options
 
 ```
-usage: qoder_autologin.py [-h] [--batch FILE] [--headless]
-                          [--concurrent N] [--test] [--debug]
-                          [--min-version VER] [--interactive]
+usage: qoder_autologin.py [-h] [--batch FILE] [--output FILE]
+                          [--headless] [--concurrent N]
+                          [--test] [--debug] [--interactive]
                           [--no-skip-existing]
                           [accounts ...]
 
@@ -127,31 +179,26 @@ positional arguments:
 
 options:
   -b, --batch FILE      Read accounts from file
-  --headless            Run browser in headless mode
+  -o, --output FILE     Output JSON file path (default: qoder-accounts.json)
+  --headless            Run browser in headless mode (invisible)
   -c, --concurrent N    Concurrent browser sessions (1-5, default: 1)
-  -t, --test            Test mode (don't save to DB)
-  -d, --debug           Debug output
-  --min-version VER     Minimum 9router version (default: 0.4.71)
+  -t, --test            Test mode: get token but don't save to JSON
+  -d, --debug           Enable debug output
   -i, --interactive     Interactive prompts before running
-  --no-skip-existing    Re-login even if account exists in 9router
+  --no-skip-existing    Re-login even if account already exists in output JSON
 ```
 
 ## 🛡️ Safety Features
 
 ### Skip Existing Accounts
-By default, akun yang sudah ada di 9router DB **di-skip otomatis**.
+By default, akun yang sudah ada di file JSON output **di-skip otomatis**.
 Gunakan `--no-skip-existing` untuk force re-login (misal token expired).
 
-### 9router Version Check
-Script akan **block** kalau 9router versi terlalu lama:
-```
-[ERR] 9router version 0.4.55 is TOO OLD!
-[ERR] Minimum required: 0.4.71
-[ERR] Update with:  npm install -g 9router@latest
-```
-
 ### Test Mode
-`--test` flag: jalankan login tanpa save ke DB. Berguna untuk testing akun baru.
+`--test` flag: jalankan login tanpa save ke JSON. Berguna untuk testing akun baru.
+
+### Merge & Update
+Kalau file output sudah ada, akun baru di-**append** dan akun yang sudah ada di-**update** (token, expiry, dll). Priority otomatis di-increment.
 
 ## 🔄 Transfer ke Device Lain
 
@@ -160,15 +207,16 @@ Script akan **block** kalau 9router versi terlalu lama:
 3. Jalankan `setup.bat`
 4. Isi `accounts.txt`
 5. Double-click `run-batch.bat`
+6. File `qoder-accounts.json` berisi semua token yang berhasil login
 
 ## ⚡ Performance
 
 | Mode | Per Account | 10 Accounts |
 |------|------------|-------------|
-| Visible, concurrent=1 | ~35s | ~6 min |
-| Headless, concurrent=1 | ~30s | ~5 min |
-| Visible, concurrent=3 | ~35s each | ~2 min |
-| Headless, concurrent=3 | ~30s each | ~1.5 min |
+| Visible, concurrent=1 | ~24s | ~4 min |
+| Headless, concurrent=1 | ~20s | ~3.5 min |
+| Visible, concurrent=3 | ~24s each | ~1.5 min |
+| Headless, concurrent=3 | ~20s each | ~1 min |
 
 > ⚠️ Concurrent > 2 bisa trigger Google rate-limiting. Recommended: **concurrent 1-2**.
 
@@ -178,9 +226,8 @@ Script akan **block** kalau 9router versi terlalu lama:
 - Sudah di-handle otomatis (retry). Kalau masih gagal, coba `--concurrent 1`
 
 **Token tidak datang:**
-- Pastikan 9router versi >= 0.4.71
-- Pastikan 9router sedang jalan
 - Cek koneksi internet
+- Pastikan akun Google tidak kena suspend/blocked
 
 **Google CAPTCHA / 2FA:**
 - Browser visible (default) biar bisa handle manual
@@ -189,6 +236,23 @@ Script akan **block** kalau 9router versi terlalu lama:
 **Consent screen stuck:**
 - Script auto-handle kebanyakan consent screen
 - Kalau ada yang baru, submit issue dengan screenshot
+
+## 📝 Changelog
+
+### v4 (Current)
+- **BREAKING**: Output berubah dari 9router SQLite DB → file JSON portable
+- Hapus dependency ke 9router, Node.js, dan SQLite
+- Tambah `--output / -o` untuk custom output path
+- Batch save dengan merge/update logic
+- Format JSON kompatibel dengan 9router `providerConnections`
+- Performance optimization: login 39% lebih cepat (39s → 24s)
+- Robust selectAccounts handling dengan retry + fallback
+
+### v3
+- Headless support, consent handling, private network blocking
+
+### v2
+- Initial batch mode + Google SSO
 
 ## 📄 License
 
