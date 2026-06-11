@@ -30,3 +30,6 @@ accounts.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Extracted tokens (NEVER commit — contains live OAuth access tokens)
+qoder-accounts.json

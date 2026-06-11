@@ -909,25 +909,39 @@ async def process_account(email, password, test_only=False):
     poll_task = asyncio.create_task(poll_device_token(nonce, verifier, 180, email))
     result = await automate_login(email, password, nonce, challenge, mid)
 
-    if result.get("error") and not result.get("login_done"):
+    # The device-token poll is the SOURCE OF TRUTH: Qoder issues the token once
+    # the OAuth consent completes, independent of whether the browser automation
+    # finished cleanly. A browser error that happens AFTER the token was issued
+    # (e.g. the Google page navigating to the consent/SetSID screen mid
+    # password-fill, which raises a Locator.press timeout) must NOT discard a
+    # token we already hold.
+    browser_failed = bool(result.get("error")) and not result.get("login_done")
+
+    # Only abort early on a HARD pre-login failure (Google SSO button never
+    # found) where no token can ever arrive — avoids waiting the full poll
+    # timeout on a genuinely dead login.
+    if browser_failed and result.get("error") == "google_sso_not_found":
         log(f"[{email}] Login failed: {result['error']}", "ERR")
         poll_task.cancel()
         return {"success": False, "email": email, "error": result["error"]}
 
-    # Check if token already ready (fast path)
+    # Otherwise wait for the token poll to settle (it has its own 180s timeout).
     if poll_task.done():
         token_data = poll_task.result()
         if token_data and token_data.get("token"):
             log(f"[{email}] Token already ready!", "OK")
         else:
             log(f"[{email}] Waiting for device token...", "WAIT")
+            token_data = await poll_task
     else:
         log(f"[{email}] Waiting for device token...", "WAIT")
         token_data = await poll_task
 
     if not token_data or not token_data.get("token"):
-        log(f"[{email}] Token timeout!", "ERR")
-        return {"success": False, "email": email, "error": "token_timeout"}
+        # No token AND browser errored -> surface the real browser error.
+        err = result.get("error") or "token_timeout"
+        log(f"[{email}] Failed: {err}", "ERR")
+        return {"success": False, "email": email, "error": err}
 
     at = token_data["token"]
     rt = token_data.get("refreshToken", "")
