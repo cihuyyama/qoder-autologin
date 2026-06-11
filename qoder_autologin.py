@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qoder Auto-Login for 9router  (v3 — Batch + Headless + Portable)
+Qoder Auto-Login — JSON Output (v4 — Batch + Headless + JSON Export)
 Reverse-engineered from 9router v0.4.71 source code.
 
 Features:
@@ -8,7 +8,7 @@ Features:
   - Batch mode from file (one email:password per line)
   - Concurrent processing (--concurrent N)
   - Headless or visible browser (--headless)
-  - Auto-save to 9router SQLite database
+  - Auto-save to JSON file (9router providerConnections format)
   - Portable: works on any Windows machine with Python 3.8+
 
 Usage:
@@ -16,14 +16,18 @@ Usage:
   python qoder_autologin.py --batch accounts.txt
   python qoder_autologin.py --batch accounts.txt --headless --concurrent 3
   python qoder_autologin.py --test user@gmail.com:password
+  python qoder_autologin.py --batch accounts.txt --output qoder-accounts.json
 """
 
-import argparse, asyncio, base64, hashlib, json, os, secrets, sqlite3, ssl, sys, time, uuid
+import argparse, asyncio, base64, hashlib, json, secrets, ssl, sys, time, uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
 import aiohttp
+
+# ── Default output file ───────────────────────────────────────────────
+DEFAULT_OUTPUT_FILE = "qoder-accounts.json"
 
 # ── Qoder Constants (from 9router source) ─────────────────────────────
 QODER_OPENAPI_BASE      = "https://openapi.qoder.sh"
@@ -32,23 +36,14 @@ QODER_LOGIN_URL         = "https://qoder.com/device/selectAccounts"
 QODER_DEVICE_TOKEN_POLL = f"{QODER_OPENAPI_BASE}/api/v1/deviceToken/poll"
 QODER_USERINFO_URL      = f"{QODER_OPENAPI_BASE}/api/v1/userinfo"
 
-# ── 9router paths ──────────────────────────────────────────────────────
-APPDATA = os.environ.get("APPDATA", "")
-NINEROUTER_DATA_DIR     = Path(APPDATA) / "9router" if APPDATA else None
-NINEROUTER_DB_PATH      = NINEROUTER_DATA_DIR / "db" / "data.sqlite" if NINEROUTER_DATA_DIR else None
-NINEROUTER_MACHINE_ID   = NINEROUTER_DATA_DIR / "machine-id" if NINEROUTER_DATA_DIR else None
-
-# ── Minimum 9router version ───────────────────────────────────────────
-MIN_9ROUTER_VERSION = "0.4.71"
-
-# ── SSL ────────────────────────────────────────────────────────────────
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
-
 # ── Global config (set by argparse) ───────────────────────────────────
 HEADLESS = False
 DEBUG_ENABLED = False
+OUTPUT_FILE = DEFAULT_OUTPUT_FILE
+
+_SSL_CTX = ssl.create_default_context()
+_SSL_CTX.check_hostname = False
+_SSL_CTX.verify_mode = ssl.CERT_NONE
 
 
 def log(msg, level="INFO"):
@@ -73,48 +68,7 @@ def generate_nonce():
     return secrets.token_hex(16)
 
 def get_machine_id():
-    if NINEROUTER_MACHINE_ID and NINEROUTER_MACHINE_ID.exists():
-        mid = NINEROUTER_MACHINE_ID.read_text().strip()
-        if mid: return mid
     return str(uuid.uuid4())
-
-
-def parse_version(v):
-    """Parse version string '0.4.71' → tuple (0, 4, 71)"""
-    try:
-        return tuple(int(x) for x in v.strip().split("."))
-    except:
-        return (0, 0, 0)
-
-
-def check_9router_version(min_version=None):
-    """Check 9router installation and version. Returns (installed, version, ok)"""
-    if min_version is None:
-        min_version = MIN_9ROUTER_VERSION
-    import subprocess
-
-    # Method 1: npm global package.json
-    try:
-        result = subprocess.run(
-            ["node", "-e",
-             "try{const p=require(require('path').join("
-             "require('child_process').execSync('npm root -g').toString().trim(),"
-             "'9router','package.json'));console.log(p.version)}"
-             "catch(e){console.log('NOT_FOUND')}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        version = result.stdout.strip()
-        if version and version != "NOT_FOUND":
-            ok = parse_version(version) >= parse_version(min_version)
-            return True, version, ok
-    except:
-        pass
-
-    # Method 2: check if DB exists at least
-    if NINEROUTER_DB_PATH and NINEROUTER_DB_PATH.exists():
-        return True, "unknown", False
-
-    return False, None, False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -827,77 +781,101 @@ async def _get_page_error(page):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Phase 3 — Save to 9router DB
+#  Phase 3 — Save to JSON
 # ══════════════════════════════════════════════════════════════════════
-def get_existing_qoder_emails():
-    """Get set of existing Qoder emails from 9router DB."""
-    if not NINEROUTER_DB_PATH or not NINEROUTER_DB_PATH.exists():
-        return set()
+def load_existing_json(output_path):
     try:
-        conn = sqlite3.connect(str(NINEROUTER_DB_PATH))
-        c = conn.cursor()
-        c.execute("SELECT LOWER(email) FROM providerConnections WHERE provider='qoder' AND email IS NOT NULL")
-        emails = {row[0].lower() for row in c.fetchall()}
-        conn.close()
-        return emails
+        p = Path(output_path)
+        if p.exists() and p.stat().st_size > 0:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return data
     except Exception as e:
-        dbg(f"Failed to read existing emails: {e}")
-        return set()
+        dbg(f"Failed to load existing JSON: {e}")
+    return []
 
 
-def save_to_9router_db(email, display_name, access_token, refresh_token,
-                       expires_at, user_id, machine_id, org_id=""):
-    if not NINEROUTER_DB_PATH or not NINEROUTER_DB_PATH.exists():
-        log(f"9router DB not found at {NINEROUTER_DB_PATH}", "ERR")
-        log("Make sure 9router is installed and has been run at least once.", "ERR")
-        return False
+def get_existing_qoder_emails(output_path):
+    existing = load_existing_json(output_path)
+    return {item.get("email", "").lower() for item in existing if item.get("email")}
 
+
+def build_qoder_connection(email, display_name, access_token, refresh_token,
+                           expires_at, user_id, machine_id, priority=1, org_id=""):
     now = datetime.now(timezone.utc).isoformat()
-    conn_id = str(uuid.uuid4())
-
-    data = {
+    return {
         "displayName": display_name or email.split("@")[0],
         "accessToken": access_token,
         "refreshToken": refresh_token or "",
         "expiresAt": expires_at,
         "testStatus": "active",
-        "expiresIn": 2591997,
+        "expiresIn": 2591998,
         "providerSpecificData": {
             "authMethod": "device",
             "userId": user_id or "",
             "machineId": machine_id,
             "organizationId": org_id or "",
         },
+        "lastError": None,
+        "errorCode": None,
+        "lastErrorAt": None,
+        "backoffLevel": 0,
+        "id": str(uuid.uuid4()),
+        "provider": "qoder",
+        "authType": "oauth",
+        "name": email,
+        "email": email,
+        "priority": priority,
+        "isActive": True,
+        "createdAt": now,
+        "updatedAt": now,
     }
 
-    try:
-        conn = sqlite3.connect(str(NINEROUTER_DB_PATH))
-        c = conn.cursor()
-        c.execute("SELECT id FROM providerConnections WHERE provider='qoder' AND email=?",
-                  (email,))
-        existing = c.fetchone()
 
-        if existing:
-            c.execute("""UPDATE providerConnections
-                         SET data=?, name=?, updatedAt=?, isActive=1
-                         WHERE id=?""",
-                      (json.dumps(data), display_name or email, now, existing[0]))
-            log(f"[{email}] Updated existing connection", "OK")
+def save_to_json(results, output_path):
+    existing = load_existing_json(output_path)
+    existing_emails = {item.get("email", "").lower(): i for i, item in enumerate(existing)}
+    max_priority = max((item.get("priority", 0) for item in existing), default=0)
+
+    added = 0
+    updated = 0
+    for r in results:
+        if not r.get("success"):
+            continue
+        email = r["email"]
+        email_lower = email.lower()
+
+        if email_lower in existing_emails:
+            idx = existing_emails[email_lower]
+            old = existing[idx]
+            entry = build_qoder_connection(
+                email, r.get("displayName", ""), r["accessToken"],
+                r["refreshToken"], r["expiresAt"], r.get("userId", ""),
+                r.get("machineId", ""),
+                priority=old.get("priority", 1),
+            )
+            entry["id"] = old.get("id", entry["id"])
+            entry["createdAt"] = old.get("createdAt", entry["createdAt"])
+            existing[idx] = entry
+            updated += 1
+            log(f"[{email}] Updated in JSON", "OK")
         else:
-            c.execute("SELECT COALESCE(MAX(priority),0)+1 FROM providerConnections WHERE provider='qoder'")
-            pri = c.fetchone()[0]
-            c.execute("""INSERT INTO providerConnections
-                         (id, provider, authType, name, email, priority, isActive, data, createdAt, updatedAt)
-                         VALUES (?, 'qoder', 'oauth', ?, ?, ?, 1, ?, ?, ?)""",
-                      (conn_id, display_name or email, email, pri, json.dumps(data), now, now))
-            log(f"[{email}] Created new connection", "OK")
+            entry = build_qoder_connection(
+                email, r.get("displayName", ""), r["accessToken"],
+                r["refreshToken"], r["expiresAt"], r.get("userId", ""),
+                r.get("machineId", ""),
+                priority=max_priority + added + 1,
+            )
+            existing.append(entry)
+            added += 1
+            log(f"[{email}] Added to JSON", "OK")
 
-        conn.commit()
-        conn.close()
-        return True
-    except Exception as e:
-        log(f"[{email}] DB error: {e}", "ERR")
-        return False
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(existing, f, indent=2, ensure_ascii=False)
+
+    log(f"JSON saved: {output_path} ({added} added, {updated} updated, {len(existing)} total)", "OK")
+    return True
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -968,19 +946,13 @@ async def process_account(email, password, test_only=False):
 
     out = {"success": True, "email": email, "displayName": name,
            "accessToken": at, "refreshToken": rt, "expiresAt": exp,
-           "userId": uid, "elapsed": round(elapsed, 1)}
+           "userId": uid, "machineId": mid, "elapsed": round(elapsed, 1)}
 
     if test_only:
         log(f"[{email}] [TEST] Token OK. Not saving. ({elapsed:.0f}s)", "OK")
         return out
 
-    if save_to_9router_db(email, name, at, rt, exp, uid, mid):
-        log(f"[{email}] Saved to 9router! ({elapsed:.0f}s)", "OK")
-    else:
-        log(f"[{email}] DB save failed", "ERR")
-        out["success"] = False
-        out["error"] = "db_save_failed"
-
+    log(f"[{email}] Login successful! ({elapsed:.0f}s)", "OK")
     return out
 
 
@@ -1018,7 +990,7 @@ async def run_batch(accounts, test_only=False, concurrent=1):
 # ══════════════════════════════════════════════════════════════════════
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Qoder Auto-Login for 9router",
+        description="Qoder Auto-Login — JSON Output",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1026,7 +998,7 @@ Examples:
   python qoder_autologin.py --batch accounts.txt
   python qoder_autologin.py --batch accounts.txt --headless --concurrent 3
   python qoder_autologin.py --test user@gmail.com:password
-  python qoder_autologin.py --batch accounts.txt --test --headless
+  python qoder_autologin.py --batch accounts.txt --output qoder-accounts.json
 
 Account format (in file):
   email:password
@@ -1038,34 +1010,31 @@ Account format (in file):
                         help="email:password pairs (space-separated)")
     parser.add_argument("--batch", "-b", metavar="FILE",
                         help="Read accounts from file (one email:password per line)")
+    parser.add_argument("--output", "-o", default=DEFAULT_OUTPUT_FILE,
+                        help=f"Output JSON file path (default: {DEFAULT_OUTPUT_FILE})")
     parser.add_argument("--test", "-t", action="store_true",
-                        help="Test mode: get token but don't save to DB")
+                        help="Test mode: get token but don't save to JSON")
     parser.add_argument("--headless", action="store_true",
                         help="Run browser in headless mode (invisible)")
     parser.add_argument("--concurrent", "-c", type=int, default=1,
                         help="Number of concurrent browser sessions (default: 1)")
     parser.add_argument("--debug", "-d", action="store_true",
                         help="Enable debug output")
-    parser.add_argument("--min-version", default=MIN_9ROUTER_VERSION,
-                        help=f"Minimum 9router version required (default: {MIN_9ROUTER_VERSION})")
     parser.add_argument("--interactive", "-i", action="store_true",
                         help="Interactive mode: show info and ask before running")
     parser.add_argument("--no-skip-existing", action="store_true",
-                        help="Re-login even if account already exists in 9router")
+                        help="Re-login even if account already exists in output JSON")
     return parser.parse_args()
 
 
 async def async_main():
-    global HEADLESS, DEBUG_ENABLED
+    global HEADLESS, DEBUG_ENABLED, OUTPUT_FILE
 
     args = parse_args()
     HEADLESS = args.headless
     DEBUG_ENABLED = args.debug
+    OUTPUT_FILE = args.output
 
-    # Override minimum version if specified
-    min_ver = args.min_version
-
-    # Collect accounts
     accounts = []
 
     if args.batch:
@@ -1092,20 +1061,18 @@ async def async_main():
         log("Run with --help for usage info.", "ERR")
         sys.exit(1)
 
-    # ── Skip existing accounts ──
     if not args.test and not args.no_skip_existing:
-        existing = get_existing_qoder_emails()
+        existing = get_existing_qoder_emails(OUTPUT_FILE)
         if existing:
             before = len(accounts)
             accounts = [acc for acc in accounts if acc.split(":", 1)[0].lower() not in existing]
             skipped = before - len(accounts)
             if skipped:
-                log(f"Skipped {skipped} account(s) already in 9router DB")
+                log(f"Skipped {skipped} account(s) already in {OUTPUT_FILE}")
             if not accounts:
-                log("All accounts already exist in 9router. Nothing to do.", "OK")
+                log(f"All accounts already exist in {OUTPUT_FILE}. Nothing to do.", "OK")
                 sys.exit(0)
 
-    # ── Interactive mode ──
     if args.interactive:
         print(f"  [i] Found {len(accounts)} account(s)")
         print()
@@ -1118,13 +1085,11 @@ async def async_main():
         print("  ---------------------------------------------------")
         print()
 
-        # Ask headless
         headless_input = input("  Headless mode? (browser invisible) [y/N]: ").strip().lower()
         HEADLESS = headless_input == "y"
         args.headless = HEADLESS
         print()
 
-        # Ask concurrent
         conc_input = input("  Concurrent browsers (1-5) [1]: ").strip()
         try:
             conc = int(conc_input)
@@ -1134,17 +1099,21 @@ async def async_main():
         args.concurrent = conc
         print()
 
-        # Summary
+        output_input = input(f"  Output JSON file [{OUTPUT_FILE}]: ").strip()
+        if output_input:
+            OUTPUT_FILE = output_input
+            args.output = OUTPUT_FILE
+        print()
+
         mode_str = "Headless (invisible)" if HEADLESS else "Visible"
         print("  +--------------------------------------+")
         print(f"  |  Accounts:   {len(accounts)}")
         print(f"  |  Browser:    {mode_str}")
         print(f"  |  Concurrent: {args.concurrent}")
-        print(f"  |  Save to:    9router DB")
+        print(f"  |  Output:     {OUTPUT_FILE}")
         print("  +--------------------------------------+")
         print()
 
-        # Confirm
         confirm = input("  Start login? [Y/n]: ").strip().lower()
         if confirm == "n":
             print()
@@ -1154,43 +1123,20 @@ async def async_main():
         print("  Starting...")
         print()
 
-    # Header
     mode = "HEADLESS" if HEADLESS else "VISIBLE"
     test = " | TEST MODE" if args.test else ""
-    log(f"Qoder Auto-Login v3 | {len(accounts)} account(s) | {mode} | concurrent={args.concurrent}{test}")
+    log(f"Qoder Auto-Login v4 | {len(accounts)} account(s) | {mode} | concurrent={args.concurrent}{test}")
+    log(f"Output: {OUTPUT_FILE}")
 
-    # ── 9router version check ──
-    installed, version, version_ok = check_9router_version(min_ver)
-
-    if not installed:
-        log("9router is NOT installed!", "ERR")
-        log("Install it first:  npm install -g 9router", "ERR")
-        sys.exit(1)
-
-    log(f"9router version: {version}")
-
-    if not version_ok:
-        log(f"9router version {version} is TOO OLD!", "ERR")
-        log(f"Minimum required: {min_ver}", "ERR")
-        log(f"Update with:  npm install -g 9router@latest", "ERR")
-        log(f"Then restart 9router before running this tool.", "ERR")
-        sys.exit(1)
-
-    if not args.test and (not NINEROUTER_DB_PATH or not NINEROUTER_DB_PATH.exists()):
-        log(f"9router database not found: {NINEROUTER_DB_PATH}", "ERR")
-        log("Run 9router at least once to create the database.", "ERR")
-        sys.exit(1)
-
-    log(f"9router DB: {NINEROUTER_DB_PATH}")
-
-    # Run
     start = time.time()
     results = await run_batch(accounts, test_only=args.test, concurrent=args.concurrent)
 
-    # Summary
     total_time = time.time() - start
     ok = sum(1 for r in results if r.get("success"))
     fail = len(results) - ok
+
+    if not args.test and ok > 0:
+        save_to_json([r for r in results if r.get("success")], OUTPUT_FILE)
 
     log(f"\n{'='*60}", "SUM")
     log(f"SUMMARY: {ok}✅ {fail}❌ | Total: {total_time:.1f}s | Avg: {total_time/max(len(results),1):.1f}s/account", "SUM")
@@ -1204,8 +1150,12 @@ async def async_main():
 
     if ok == len(results):
         log(f"\n🎉 All {ok} accounts processed successfully!", "OK")
+        if not args.test:
+            log(f"📄 Output saved to: {OUTPUT_FILE}", "OK")
     else:
         log(f"\n⚠️  {fail} account(s) failed. Check logs above.", "ERR")
+        if not args.test and ok > 0:
+            log(f"📄 Successful accounts saved to: {OUTPUT_FILE}", "OK")
 
 
 def main():
